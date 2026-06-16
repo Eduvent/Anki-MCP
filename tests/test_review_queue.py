@@ -289,6 +289,68 @@ def test_correct_reingests_and_reclassifies(tmp_path, monkeypatch):
     assert row["status"] == "aprobada"  # ya sin ambigüedad
 
 
+def test_precision_metrics_tracks_dup_flag_overrides(tmp_path):
+    """§11: las flags possible_duplicate conservadas vs descartadas = FP vs TP."""
+    reg = Registry(tmp_path / "t.db")
+    a = _insert(reg, _classified("Q1", "A1"), "possible_duplicate")
+    b = _insert(reg, _classified("Q2", "A2"), "possible_duplicate")
+    reg.update_action(a, "insert")  # aprobada: conservada pese a la flag → FP
+    reg.update_action(b, "reject")  # descartada: dup confirmado → TP
+    flag = reg.precision_metrics()["dup_flag"]
+    assert flag["kept_overridden"] == 1
+    assert flag["confirmed_discarded"] == 1
+    assert flag["false_positive_proxy"] == 0.5
+    # audit_action es inmutable (sobrevivió al update_action)
+    assert reg.get_by_id(a)["audit_action"] == "possible_duplicate"
+
+
+def test_purge_hard_deletes_record(tmp_path):
+    """§5: purge borra el registro físicamente (a diferencia de reject)."""
+    import acm.service as service
+    reg = Registry(tmp_path / "t.db")
+    rid = _insert(reg, _classified("Q", "A"), "possible_duplicate")
+    res = service.resolve_record(reg, rid, "purge")
+    assert res["status"] == "purged"
+    assert reg.get_by_id(rid) is None
+
+
+def test_delete_ingest_batch_keeps_uploaded(tmp_path):
+    reg = Registry(tmp_path / "t.db")
+    rid = reg.insert(AuditDecision(card=_classified("Q", "A"), action="insert", reason="x"),
+                     ingest_batch="B1")
+    reg.mark_uploaded(rid, 999, "S1")  # pasa a subida
+    deleted, kept = reg.delete_ingest_batch("B1")
+    assert deleted == 0 and kept == 1  # no se borra lo ya subido
+    assert reg.get_by_id(rid) is not None
+
+
+def test_undo_ingest_batch_deletes_records(tmp_path, monkeypatch):
+    """§5: acm_undo(lote_ingesta) borra del registro las cards creadas."""
+    import acm.mcp_server as srv
+    settings = load_settings()
+    settings.acm.use_embeddings = False
+    name, profile, taxonomy = load_profile_taxonomy(settings)
+    reg = Registry(tmp_path / "t.db")
+    monkeypatch.setattr(srv, "_setup", lambda *a, **k: (reg, settings, name, profile, taxonomy))
+
+    class _NoAnki:
+        def __init__(self, *a, **k):
+            pass
+
+        def is_available(self):
+            return False
+
+    monkeypatch.setattr(srv, "AnkiConnectClient", _NoAnki)
+
+    r = json.loads(srv.acm_ingest(json.dumps([{"front": "What is X?", "back": "Y", "source": "claude"}])))
+    batch = r["ingest_batch"]
+    assert batch and len(reg.list_processed_cards()) == 1
+    undo = json.loads(srv.acm_undo(batch))
+    assert undo["kind"] == "ingest"
+    assert undo["deleted_records"] == 1
+    assert reg.list_processed_cards() == []
+
+
 def test_metrics_auto_vs_escalated(tmp_path):
     reg = Registry(tmp_path / "t.db")
     _insert(reg, _classified("Q1", "A1"), "insert")  # aprobada

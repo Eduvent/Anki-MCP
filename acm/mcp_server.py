@@ -7,6 +7,7 @@ puede descubrir y llamar directamente.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -235,7 +236,9 @@ def acm_ingest(cards_json: str, on_exact_match: str = "update", verbose: bool = 
     if mode not in {"update", "skip", "new"}:
         mode = "update"
 
+    ingest_batch_id = datetime.now(timezone.utc).isoformat()  # §5: lote de ingesta (deshacible)
     persisted = []  # (decision, outcome, record_id)
+    inserted_count = 0
     for d in decisions:
         existing = None if mode == "new" else registry.find_by_fingerprint(d.card.fingerprint)
         if existing is not None:
@@ -245,7 +248,8 @@ def acm_ingest(cards_json: str, on_exact_match: str = "update", verbose: bool = 
             else:  # skip
                 persisted.append((d, "skipped", existing["id"]))
         else:
-            record_id = registry.insert(d)
+            record_id = registry.insert(d, ingest_batch=ingest_batch_id)
+            inserted_count += 1
             persisted.append((d, d.action, record_id))
 
     if anki_client:
@@ -278,6 +282,8 @@ def acm_ingest(cards_json: str, on_exact_match: str = "update", verbose: bool = 
         "decisions": results,
         "summary": summary,
         "on_exact_match": mode,
+        # §5: id del lote para deshacer esta ingesta con acm_undo (si insertó algo).
+        "ingest_batch": ingest_batch_id if inserted_count else None,
         "anki_available": anki_client is not None,
         "embeddings_used": _embeddings_used(settings),
         "parse_errors": parse_errors,
@@ -439,7 +445,8 @@ def acm_resolve(
 
     Args:
         record_id: ID completo o prefijo del registro.
-        action: "approve" (→ aprobada), "reject" (→ descartada), o "correct".
+        action: "approve" (→ aprobada), "reject" (→ descartada), "purge" (borrado
+            físico del registro) o "correct".
         front, back: contenido corregido (requeridos para action="correct").
         tags: tags sugeridos para la corrección (opcional, "category::value").
         note_type, deck: corrección opcional de modelo/mazo (§5).
@@ -449,7 +456,7 @@ def acm_resolve(
     """
     normalized = action.strip().lower()
 
-    if normalized in {"approve", "reject"}:
+    if normalized in {"approve", "reject", "purge"}:
         registry, _, _, _, _ = _setup()
         return json.dumps(_service_resolve(registry, record_id, normalized))
 
@@ -477,7 +484,7 @@ def acm_resolve(
             "matches": decision.match_details,
         })
 
-    return json.dumps({"error": "action debe ser 'approve', 'reject' o 'correct'"})
+    return json.dumps({"error": "action debe ser 'approve', 'reject', 'purge' o 'correct'"})
 
 
 @mcp.tool()
@@ -502,11 +509,17 @@ def acm_sync(export_tsv: str | None = None, dry_run: bool = False) -> str:
 
 @mcp.tool()
 def acm_undo(batch_id: str) -> str:
-    """E9-2: deshace un lote de sync — borra esas notas de Anki y revierte el
-    estado de las tarjetas a 'aprobada'. Mirá los lotes con acm_stats.
+    """Deshace un lote por id (E9-2 / §5). Detecta el tipo automáticamente:
+
+      - lote de SYNC (de acm_sync): borra esas notas de Anki y revierte las
+        tarjetas a 'aprobada'.
+      - lote de INGEST (de acm_ingest): borra del registro las tarjetas creadas
+        en esa ingesta (no toca las ya subidas a Anki).
+
+    Mirá los lotes disponibles (sync_batches / ingest_batches) con acm_stats.
 
     Args:
-        batch_id: id del lote (lo devuelve acm_sync y lo lista acm_stats).
+        batch_id: id del lote (lo devuelven acm_sync / acm_ingest y los lista acm_stats).
     """
     registry, settings, _, _, _ = _setup()
     return json.dumps(_service_undo(registry, settings, batch_id))
@@ -766,18 +779,25 @@ def acm_stats() -> str:
     """
     registry, _, _, _, _ = _setup()
     data = registry.stats()
-    metrics = registry.metrics()
-    batches = [
+    sync_batches = [
         {"batch_id": row["sync_batch"], "note_count": row["note_count"],
          "created_at": row["created_at"]}
         for row in registry.list_sync_batches()
+    ]
+    ingest_batches = [
+        {"batch_id": row["ingest_batch"], "note_count": row["note_count"],
+         "created_at": row["created_at"]}
+        for row in registry.list_ingest_batches()
     ]
     return json.dumps({
         "by_action": data,
         "total": sum(data.values()),
         # E9-4: observabilidad — estados + auto-resueltas vs escaladas al usuario.
-        "metrics": metrics,
-        "sync_batches": batches,  # E9-2: lotes deshacibles con acm_undo
+        "metrics": registry.metrics(),
+        # §11: telemetría de precisión de dedup (proxy de falsos positivos).
+        "precision": registry.precision_metrics(),
+        "sync_batches": sync_batches,    # deshacibles con acm_undo (borra de Anki)
+        "ingest_batches": ingest_batches,  # deshacibles con acm_undo (borra del registro)
     })
 
 

@@ -56,3 +56,20 @@ def test_comparison_key_is_symmetric():
 
 def test_detect_intent_defaults_to_unknown():
     assert detect_intent("Lista tres ventajas de usar CDN") == "unknown"
+
+
+def test_acronym_intent_and_semantic_key():
+    assert build_semantic_key("¿Qué significan las siglas EC2?") == "acronym::ec2"
+    assert build_semantic_key("What does IAM stand for?") == "acronym::iam"
+    assert detect_intent("What does IAM stand for?") == "acronym"
+
+
+def test_acronym_cross_lingual_shares_key():
+    assert build_semantic_key("What does S3 stand for?") == build_semantic_key(
+        "¿Qué significan las siglas S3?"
+    )
+
+
+def test_plain_que_significa_stays_definition():
+    # sin "siglas" → definición, no acrónimo
+    assert build_semantic_key("¿Qué significa un CDN?") == "definition::cdn"

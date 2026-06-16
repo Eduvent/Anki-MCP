@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS processed_cards (
     material_origen TEXT,
     status TEXT NOT NULL DEFAULT 'aprobada',
     reason TEXT,
-    sync_batch TEXT
+    sync_batch TEXT,
+    audit_action TEXT,
+    ingest_batch TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_fingerprint ON processed_cards(fingerprint);
@@ -157,8 +159,11 @@ class Registry:
             "status": "TEXT NOT NULL DEFAULT 'aprobada'",
             "reason": "TEXT",
             "sync_batch": "TEXT",
+            "audit_action": "TEXT",
+            "ingest_batch": "TEXT",
         }
         status_added = "status" not in pc_columns
+        audit_action_added = "audit_action" not in pc_columns
         for col_name, col_def in new_pc_cols.items():
             if col_name not in pc_columns:
                 conn.execute(f"ALTER TABLE processed_cards ADD COLUMN {col_name} {col_def}")
@@ -171,6 +176,14 @@ class Registry:
                 f"  WHEN action_taken = 'possible_duplicate' THEN '{STATUS_IN_REVIEW}' "
                 f"  WHEN anki_note_id IS NOT NULL THEN '{STATUS_UPLOADED}' "
                 f"  ELSE '{STATUS_APPROVED}' END"
+            )
+
+        # Telemetría (§11): backfill del veredicto original desde action_taken
+        # (aproximado para filas legacy; exacto de aquí en más vía insert()).
+        if audit_action_added:
+            conn.execute(
+                "UPDATE processed_cards SET audit_action = action_taken "
+                "WHERE audit_action IS NULL"
             )
 
         # C-1: retirar columnas legacy scope_vendor/topic/cert (facets+scope_json
@@ -220,8 +233,17 @@ class Registry:
         finally:
             conn.close()
 
-    def insert(self, decision: AuditDecision, anki_note_id: int | None = None) -> str:
-        """Registra una tarjeta procesada. Retorna el ID generado."""
+    def insert(
+        self,
+        decision: AuditDecision,
+        anki_note_id: int | None = None,
+        ingest_batch: str | None = None,
+    ) -> str:
+        """Registra una tarjeta procesada. Retorna el ID generado.
+
+        `audit_action` guarda el veredicto ORIGINAL (inmutable, para telemetría);
+        `ingest_batch` etiqueta el lote de ingesta (para deshacer, §5).
+        """
         card = decision.card
         record_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
@@ -239,8 +261,9 @@ class Registry:
                      front_normalized, back_normalized,
                      scope_json, note_type,
                      tags_resolved, action_taken, anki_note_id, created_at, source,
-                     profile_name, target_deck, match_json, material_origen, status, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     profile_name, target_deck, match_json, material_origen, status, reason,
+                     audit_action, ingest_batch)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
@@ -262,6 +285,8 @@ class Registry:
                     card.material_origen,
                     status,
                     decision.reason,
+                    decision.action,  # audit_action (inmutable)
+                    ingest_batch,
                 ),
             )
         return record_id
@@ -414,6 +439,69 @@ class Registry:
             "escalated_to_user": escalated,
             "discarded": by_status.get(STATUS_DISCARDED, 0),
         }
+
+    def precision_metrics(self) -> dict:
+        """§11: telemetría de precisión de dedup (match propuesto → resolución).
+
+        Matriz veredicto_original (audit_action) → estado final, y un proxy de
+        falsos positivos: de las flags `possible_duplicate` ya resueltas, cuántas
+        terminó el usuario CONSERVANDO (aprobada/subida → la flag sobró = FP) vs
+        DESCARTANDO (descartada → dup confirmado = TP). Sirve para auto-calibrar.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT audit_action, status, COUNT(*) AS c FROM processed_cards "
+                "WHERE audit_action IS NOT NULL GROUP BY audit_action, status"
+            ).fetchall()
+        matrix: dict[str, dict[str, int]] = {}
+        for row in rows:
+            matrix.setdefault(row["audit_action"], {})[row["status"]] = row["c"]
+
+        flagged = matrix.get("possible_duplicate", {})
+        kept = flagged.get(STATUS_APPROVED, 0) + flagged.get(STATUS_UPLOADED, 0)
+        discarded = flagged.get(STATUS_DISCARDED, 0)
+        pending = flagged.get(STATUS_IN_REVIEW, 0)
+        resolved = kept + discarded
+        return {
+            "transition_matrix": matrix,
+            "dup_flag": {
+                "kept_overridden": kept,        # usuario conservó pese a la flag → FP
+                "confirmed_discarded": discarded,  # usuario descartó → dup real → TP
+                "pending": pending,
+                "resolved": resolved,
+                "false_positive_proxy": round(kept / resolved, 3) if resolved else None,
+            },
+        }
+
+    def delete_record(self, record_id: str) -> bool:
+        """§5: borrado físico de un registro (purga). True si borró algo."""
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM processed_cards WHERE id = ?", (record_id,))
+            return cur.rowcount > 0
+
+    def list_ingest_batches(self) -> list[sqlite3.Row]:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT ingest_batch, COUNT(*) AS note_count, MIN(created_at) AS created_at "
+                "FROM processed_cards WHERE ingest_batch IS NOT NULL "
+                "GROUP BY ingest_batch ORDER BY ingest_batch DESC"
+            ).fetchall()
+
+    def delete_ingest_batch(self, batch_id: str) -> tuple[int, int]:
+        """§5: deshace una ingesta — borra sus registros NO subidos a Anki.
+
+        Devuelve (borrados, conservados_por_estar_subidos). No borra los 'subida'
+        para no orfanar notas en Anki (esos se revierten con undo de sync)."""
+        with self._conn() as conn:
+            kept = conn.execute(
+                "SELECT COUNT(*) FROM processed_cards WHERE ingest_batch = ? AND status = ?",
+                (batch_id, STATUS_UPLOADED),
+            ).fetchone()[0]
+            cur = conn.execute(
+                "DELETE FROM processed_cards WHERE ingest_batch = ? AND status != ?",
+                (batch_id, STATUS_UPLOADED),
+            )
+            return cur.rowcount, kept
 
     def stats(self) -> dict[str, int]:
         with self._conn() as conn:

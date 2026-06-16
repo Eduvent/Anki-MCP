@@ -21,6 +21,14 @@ _COMPARISON_PATTERNS = (
     re.compile(r"^(.+?)\s+(?:vs|versus)\s+(.+)$"),
     re.compile(r"^(?:diferencia entre|compara)\s+(.+?)\s+(?:y|vs|versus)\s+(.+)$"),
 )
+# Acrónimos: "¿qué significan las siglas X?" / "what does X stand for".
+# Se chequean ANTES que las de definición ("qué significa X") para no robarles
+# el match. Clave estable acronym::X → dups por clave, incluso cross-lingual.
+_ACRONYM_PATTERNS = (
+    re.compile(r"^que significan?\s+(?:las\s+)?siglas?\s+(?:de\s+)?(.+)$"),
+    re.compile(r"^siglas?\s+de\s+(.+)$"),
+    re.compile(r"^what (?:does|do)\s+(.+?)\s+stand for\b.*$"),
+)
 
 
 def normalize_text(text: str) -> str:
@@ -82,6 +90,14 @@ def detect_intent_and_semantic_key(text: str) -> tuple[str, str | None]:
     normalized = normalize_semantic_text(text)
     if not normalized:
         return "unknown", None
+
+    for pattern in _ACRONYM_PATTERNS:
+        match = pattern.match(normalized)
+        if not match:
+            continue
+        subject = _canonicalize_subject(match.group(1))
+        if subject:
+            return "acronym", f"acronym::{subject}"
 
     for pattern in _DEFINITION_PATTERNS:
         match = pattern.match(normalized)

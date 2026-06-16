@@ -18,7 +18,7 @@ from acm.anki.exporter import export_rows_tsv
 from acm.config import Settings
 from acm.models import CardScope
 from acm.pipeline.similarity import _scope_from_row as scope_from_row  # canónico, único
-from acm.store.registry import Registry
+from acm.store.registry import STATUS_UPLOADED, Registry
 
 __all__ = [
     "scope_from_row",
@@ -97,10 +97,14 @@ def find_record_by_id_or_prefix(registry: Registry, record_id: str):
 
 
 def resolve_record(registry: Registry, record_id: str, action: str) -> dict:
-    """E5-1: resuelve un item de la cola con una acción (approve|reject)."""
+    """E5-1 (+ §5): resuelve un item con una acción (approve|reject|purge).
+
+    `purge` es borrado físico del registro (a diferencia de `reject` que lo deja
+    como 'descartada'). Funciona en cualquier estado.
+    """
     normalized = action.strip().lower()
-    if normalized not in {"approve", "reject"}:
-        return {"error": "action debe ser 'approve' o 'reject'"}
+    if normalized not in {"approve", "reject", "purge"}:
+        return {"error": "action debe ser 'approve', 'reject' o 'purge'"}
 
     row, error = find_record_by_id_or_prefix(registry, record_id)
     if error:
@@ -110,8 +114,20 @@ def resolve_record(registry: Registry, record_id: str, action: str) -> dict:
         registry.update_action(row["id"], "insert")
         return {"status": "approved", "id": row["id"], "estado": "aprobada",
                 "front": row["front_original"]}
-    registry.update_action(row["id"], "reject")
-    return {"status": "rejected", "id": row["id"], "estado": "descartada"}
+    if normalized == "reject":
+        registry.update_action(row["id"], "reject")
+        return {"status": "rejected", "id": row["id"], "estado": "descartada"}
+
+    # purge — borrado físico (§5)
+    was_uploaded = row["status"] == STATUS_UPLOADED if "status" in row.keys() else False
+    registry.delete_record(row["id"])
+    result = {"status": "purged", "id": row["id"]}
+    if was_uploaded:
+        result["warning"] = (
+            "El registro estaba 'subida'; la nota en Anki NO se borró. "
+            "Usá acm_undo con el lote de sync para quitarla de Anki."
+        )
+    return result
 
 
 def resolve_deck_for_row(row, settings: Settings, client: AnkiConnectClient) -> str:
@@ -232,26 +248,33 @@ def undo_batch(
     *,
     anki_client: AnkiConnectClient | None = None,
 ) -> dict:
-    """E9-2: deshace un lote de sync — borra las notas de Anki y revierte estado."""
-    rows = registry.get_batch(batch_id)
-    if not rows:
-        return {"error": f"No existe el lote: {batch_id}"}
+    """E9-2 (+ §5): deshace un lote de SYNC (borra notas de Anki + revierte) o de
+    INGEST (borra los registros creados, sin tocar los ya subidos)."""
+    sync_rows = registry.get_batch(batch_id)
+    if sync_rows:
+        note_ids = [row["anki_note_id"] for row in sync_rows if row["anki_note_id"]]
+        owns_client = anki_client is None
+        client = anki_client or try_anki_client(settings)
+        deleted = 0
+        if client is not None and note_ids:
+            try:
+                client.delete_notes(note_ids)
+                deleted = len(note_ids)
+            except AnkiConnectError as e:
+                if owns_client:
+                    client.close()
+                return {"error": f"No se pudieron borrar las notas: {e}", "anki_available": True}
+        if owns_client and client is not None:
+            client.close()
+        reverted = registry.revert_batch(batch_id)
+        return {"status": "reverted", "kind": "sync", "batch_id": batch_id,
+                "deleted_notes": deleted, "reverted_records": reverted,
+                "anki_available": client is not None}
 
-    note_ids = [row["anki_note_id"] for row in rows if row["anki_note_id"]]
-    owns_client = anki_client is None
-    client = anki_client or try_anki_client(settings)
-    deleted = 0
-    if client is not None and note_ids:
-        try:
-            client.delete_notes(note_ids)
-            deleted = len(note_ids)
-        except AnkiConnectError as e:
-            if owns_client:
-                client.close()
-            return {"error": f"No se pudieron borrar las notas: {e}", "anki_available": True}
-    if owns_client and client is not None:
-        client.close()
+    # No es lote de sync → probar lote de ingesta (borrado de registros, §5).
+    deleted_records, kept_uploaded = registry.delete_ingest_batch(batch_id)
+    if deleted_records or kept_uploaded:
+        return {"status": "reverted", "kind": "ingest", "batch_id": batch_id,
+                "deleted_records": deleted_records, "kept_uploaded": kept_uploaded}
 
-    reverted = registry.revert_batch(batch_id)
-    return {"status": "reverted", "batch_id": batch_id, "deleted_notes": deleted,
-            "reverted_records": reverted, "anki_available": client is not None}
+    return {"error": f"No existe el lote: {batch_id}"}
