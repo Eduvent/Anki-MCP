@@ -69,6 +69,22 @@ señales léxicas Y de embeddings. `compare_records` hace `max(léxico, calibrad
 pierde, con separación amplia usando un modelo liviano multilingüe y latencia
 dominada por un cache por fingerprint. Habilita E1-7 (retirar el léxico pesado).
 
+## Addendum 2026-06-16 — el coseno NO basta dentro de un dominio estrecho
+
+El spike usó pares cross-**dominio** (CDN vs pan), donde lo no-relacionado da
+coseno ~0.1-0.2. Pero en uso real, dentro de un dominio estrecho (certs cloud),
+definiciones de servicios de **distinto vendor/idioma** (Azure Cloud Shell vs AWS
+CLI) dan coseno **0.55-0.63** — "mismo tema", no "mismo hecho". La calibración
+(derivada de cross-dominio) los mapeaba a ~0.90 y se marcaban como duplicados
+(falsos positivos ≈100% en una ingesta limpia).
+
+**Fix (no fue recalibrar):** el embedding solo refuerza el score si hay
+**corroboración** (señal exacta / solape léxico) o **cuasi-identidad** (coseno
+crudo ≥ 0.96), y **nunca entre vendors distintos** (`compare_records`). El léxico
+y el scope (vendor) son señales de mayor precisión y mandan. Lección: el coseno
+es buen *recuperador* pero mal *decisor* en solitario; la decisión pondera todas
+las señales (ver `_EMBEDDING_ONLY_STRONG_RAW` y el gating en `similarity.py`).
+
 ### Limitación conocida (futuro)
 
 El clustering full-collection es O(M²·dim). Para 429 notas ≈ 13 s (aceptable; es

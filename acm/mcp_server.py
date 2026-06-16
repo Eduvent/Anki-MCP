@@ -40,7 +40,7 @@ from acm.pipeline.similarity import (
 )
 from acm.service import (
     backup_registry as _backup_registry,
-    find_record_by_id_or_prefix as _find_record_by_id_or_prefix,
+    resolve_model_name as _resolve_model_name,
     resolve_record as _service_resolve,
     scope_from_row as _scope_from_row,
     sync_pending as _service_sync,
@@ -84,6 +84,30 @@ def _matches_from_row(row) -> list:
 
 def _row_status(row) -> str | None:
     return row["status"] if "status" in row.keys() else None
+
+
+def _compact_match(match: dict) -> dict:
+    """§9: match minimal para la salida (sin repetir front/back/scope completos).
+
+    §10: solo adjunta `mejor_version` cuando sugiere reemplazo (accionable); como
+    los matches ya son duplicados reales (gating de precisión), es seguro."""
+    out = {
+        "id": match.get("id"),
+        "deck": match.get("deck"),
+        "score": match.get("score"),
+        "reason_codes": match.get("reason_codes"),
+    }
+    mejor = match.get("mejor_version")
+    if isinstance(mejor, dict) and mejor.get("suggestion") == "replace_old_with_new":
+        out["mejor_version"] = mejor
+    return out
+
+
+def _matches_out(match_details: list, verbose: bool, limit: int = 2) -> list:
+    """Detalle completo si verbose; si no, top-N compacto (economía de tokens, §9)."""
+    if verbose:
+        return match_details
+    return [_compact_match(m) for m in match_details[:limit]]
 
 
 def _load_structured_input(
@@ -151,8 +175,8 @@ def _embeddings_used(settings) -> bool:
 
 
 @mcp.tool()
-def acm_ingest(cards_json: str) -> str:
-    """Procesa tarjetas candidatas: normaliza, clasifica, deduplica y decide.
+def acm_ingest(cards_json: str, on_exact_match: str = "update", verbose: bool = False) -> str:
+    """Procesa tarjetas candidatas: normaliza, clasifica, deduplica, decide y persiste.
 
     Args:
         cards_json: JSON array de tarjetas. Cada tarjeta tiene:
@@ -160,11 +184,15 @@ def acm_ingest(cards_json: str) -> str:
             - back (str, requerido): Respuesta de la tarjeta
             - source (str, requerido): Origen ("claude", "chatgpt", "manual")
             - suggested_tags (list[str], opcional): Tags en formato "category::value"
-              Categorías válidas: vendor, cert, topic, type
             - note_type (str, opcional): Tipo de nota Anki (default "Basic")
+        on_exact_match: qué hacer si el contenido ya existe (mismo fingerprint):
+            "update" (default, actualiza el registro existente — idempotente),
+            "skip" (no toca el existente) o "new" (crea uno nuevo). Evita duplicar
+            el registro al re-ingerir (reporte §7).
 
     Returns:
-        JSON con las decisiones tomadas para cada tarjeta (insert/possible_duplicate/reject).
+        JSON con la decisión/persistencia por tarjeta (insert/possible_duplicate/
+        reject/updated/skipped).
     """
     registry, settings, profile_name, profile, taxonomy = _setup()
 
@@ -201,36 +229,55 @@ def acm_ingest(cards_json: str) -> str:
         profile=profile,
     )
 
+    # Persistencia idempotente (§7): si el contenido ya existe (mismo
+    # fingerprint), upsert en sitio en vez de duplicar el registro.
+    mode = on_exact_match.strip().lower()
+    if mode not in {"update", "skip", "new"}:
+        mode = "update"
+
+    persisted = []  # (decision, outcome, record_id)
     for d in decisions:
-        registry.insert(d)
+        existing = None if mode == "new" else registry.find_by_fingerprint(d.card.fingerprint)
+        if existing is not None:
+            if mode == "update":
+                registry.update_card_fields(existing["id"], d.card)
+                persisted.append((d, "updated", existing["id"]))
+            else:  # skip
+                persisted.append((d, "skipped", existing["id"]))
+        else:
+            record_id = registry.insert(d)
+            persisted.append((d, d.action, record_id))
 
     if anki_client:
         anki_client.close()
 
     results = []
-    for d in decisions:
+    for d, outcome, record_id in persisted:
         results.append({
             "front": d.card.front,
-            "action": d.action,
+            "action": outcome,        # insert/possible_duplicate/reject/updated/skipped
+            "audit": d.action,        # veredicto de auditoría (antes de upsert)
             "reason": d.reason,
+            "id_short": record_id[:8],
             "vendor": d.card.scope.vendor,
             "topic": d.card.scope.topic,
             "scope": d.card.scope.summary(),
             "tags_resolved": d.card.tags_resolved,
             "tags_unresolved": d.card.tags_unresolved,
             "confianza": _classify_confidence(d.card, profile.required_categories),
-            "matches": d.match_details,
+            "matches": _matches_out(d.match_details, verbose),
             "profile": d.card.profile,
             "deck": d.card.deck,
         })
 
     summary = {}
-    for d in decisions:
-        summary[d.action] = summary.get(d.action, 0) + 1
+    for _decision, outcome, _rid in persisted:
+        summary[outcome] = summary.get(outcome, 0) + 1
 
     return json.dumps({
         "decisions": results,
         "summary": summary,
+        "on_exact_match": mode,
         "anki_available": anki_client is not None,
         "embeddings_used": _embeddings_used(settings),
         "parse_errors": parse_errors,
@@ -238,7 +285,7 @@ def acm_ingest(cards_json: str) -> str:
 
 
 @mcp.tool()
-def acm_annotate(cards_json: str) -> str:
+def acm_annotate(cards_json: str, verbose: bool = False) -> str:
     """Anota tarjetas candidatas SIN subir ni persistir nada (E3-1 / RF-A2).
 
     Es el corazón del flujo "crear → revisar → subir": Claude propone cards y
@@ -254,6 +301,8 @@ def acm_annotate(cards_json: str) -> str:
         cards_json: JSON array. Cada card: front, back, source, y opcionales
             suggested_tags ("category::value"), note_type, profile, deck,
             material_origen (PDF/sección de origen).
+        verbose: False (default) → matches compactos (top-2) para economía de
+            tokens (§9); True → detalle completo de cada match.
     """
     registry, settings, profile_name, profile, taxonomy = _setup()
 
@@ -280,6 +329,10 @@ def acm_annotate(cards_json: str) -> str:
         profile_name=profile_name, profile=profile,
     )
 
+    # Validación temprana de note_type contra Anki (reporte §4): avisar AHORA,
+    # no tras 12 aprobaciones y un sync fallido.
+    available_models = anki_client.get_model_names() if anki_client else []
+
     annotations = []
     for decision in decisions:
         card = decision.card
@@ -298,11 +351,17 @@ def acm_annotate(cards_json: str) -> str:
         if clean_back != card.back:
             formato_sugerido["back"] = clean_back
 
+        note_type_warning = None
+        if available_models:
+            _resolved, _model_err = _resolve_model_name(card.note_type, settings, available_models)
+            if _model_err:
+                note_type_warning = _model_err  # p.ej. "el modelo 'Basic' no existe… ¿Básico?"
+
         annotations.append({
             "front": card.front,
             "es_duplicado": decision.action == "possible_duplicate",
             "action": decision.action,
-            "matches": decision.match_details,
+            "matches": _matches_out(decision.match_details, verbose),
             "mazo_sugerido": deck,
             "tags_sugeridos": card.tags_resolved,
             "tags_ambiguos": card.tags_unresolved,
@@ -311,6 +370,7 @@ def acm_annotate(cards_json: str) -> str:
             "flags_calidad": quality_flags(card.front, card.back),
             "sugerencia_cloze": suggest_cloze(card.front, card.back),  # E8-3
             "formato_sugerido": formato_sugerido or None,  # E8-4
+            "note_type_warning": note_type_warning,  # §4: aviso temprano de modelo
             "material_origen": card.material_origen,
         })
 
@@ -369,16 +429,20 @@ def acm_resolve(
     front: str | None = None,
     back: str | None = None,
     tags: list[str] | None = None,
+    note_type: str | None = None,
+    deck: str | None = None,
 ) -> str:
     """Resuelve un item de la cola de revisión con UNA sola acción (E5-1 / E5-3).
 
-    La cola incluye duplicados posibles y tarjetas con clasificación ambigua.
+    Funciona en CUALQUIER estado (id completo o prefijo), no solo en la cola
+    activa (§6). La cola incluye duplicados posibles y clasificación ambigua.
 
     Args:
         record_id: ID completo o prefijo del registro.
         action: "approve" (→ aprobada), "reject" (→ descartada), o "correct".
         front, back: contenido corregido (requeridos para action="correct").
         tags: tags sugeridos para la corrección (opcional, "category::value").
+        note_type, deck: corrección opcional de modelo/mazo (§5).
 
     Para "correct", la card corregida REINGRESA al pipeline: se re-deduplica y
     re-clasifica automáticamente (E5-3).
@@ -397,7 +461,8 @@ def acm_resolve(
         decision = correct_record(
             record_id, front=front, back=back, tags=tags or [],
             registry=registry, taxonomy=taxonomy, settings=settings,
-            profile_name=profile_name, profile=profile, anki_client=anki_client,
+            profile_name=profile_name, profile=profile,
+            note_type=note_type, deck=deck, anki_client=anki_client,
         )
         if anki_client:
             anki_client.close()

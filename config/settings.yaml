@@ -5,6 +5,11 @@ anki:
   field_mapping:
     front: "Anverso"
     back: "Reverso"
+  # Alias de modelos: note_type canónico → modelo real de tu colección (ES).
+  # "Basic" sin alias también cae al default_model de arriba si existe en Anki.
+  model_aliases:
+    Basic: "Básico"
+    Cloze: "Cloze EduSksh"
 
 acm:
   # Rutas relativas se resuelven bajo ACM_HOME (env var; default ~/.acm),

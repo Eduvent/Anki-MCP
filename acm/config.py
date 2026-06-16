@@ -92,6 +92,10 @@ class AnkiConfig(BaseModel):
     default_deck: str = "Cloud Certs"
     default_model: str = "Básico"
     field_mapping: FieldMapping = FieldMapping()
+    # Mapea note_types canónicos (Basic, Cloze) a los modelos localizados de la
+    # colección del usuario (p.ej. Básico, Cloze EduSksh). Evita el fallo tardío
+    # "model was not found: Basic" en Anki en español (reporte 2026-06-16 §4).
+    model_aliases: dict[str, str] = Field(default_factory=dict)
 
 
 class AcmConfig(BaseModel):

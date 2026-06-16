@@ -316,6 +316,26 @@ class Registry:
                 "SELECT * FROM processed_cards WHERE id = ?", (record_id,)
             ).fetchone()
 
+    def find_by_id_prefix(self, prefix: str) -> list[sqlite3.Row]:
+        """Busca por prefijo de id en TODOS los estados (no solo la cola) — §6."""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM processed_cards WHERE id LIKE ? ORDER BY created_at DESC",
+                (prefix + "%",),
+            ).fetchall()
+
+    def update_card_fields(self, record_id: str, card) -> None:
+        """Upsert por contenido (§7): actualiza campos mutables (note_type, tags,
+        scope, deck, procedencia) sin tocar id/estado/anki_note_id/created_at."""
+        scope_json = json.dumps(card.scope.summary(), sort_keys=True)
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE processed_cards SET note_type=?, tags_resolved=?, scope_json=?, "
+                "target_deck=?, material_origen=? WHERE id=?",
+                (card.note_type, " ".join(card.tags_resolved), scope_json,
+                 card.deck, card.material_origen, record_id),
+            )
+
     def update_from_decision(self, record_id: str, decision: AuditDecision) -> None:
         """E5-3: reescribe una card existente con una decisión fresca (corrección).
 

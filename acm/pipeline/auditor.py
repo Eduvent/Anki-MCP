@@ -250,10 +250,14 @@ def audit_card(
                     if tag not in classified.tags_resolved:
                         classified.tags_resolved.append(tag)
 
+    # Solo escalan a possible_duplicate los matches contra la COLECCIÓN (registro
+    # / Anki), no los hermanos del mismo lote (source="input"): un lote temático
+    # redactado a propósito no debe marcarse como duplicado de sí mismo (§8).
     strong_matches = [
         match
         for match in matches
         if match.score >= settings.acm.cluster_threshold
+        and match.record.source != "input"
     ]
     if strong_matches:
         best = strong_matches[0]
@@ -304,25 +308,29 @@ def correct_record(
     settings: Settings,
     profile_name: str,
     profile: ProfileConfig,
+    note_type: str | None = None,
+    deck: str | None = None,
     anki_client: AnkiConnectClient | None = None,
 ) -> AuditDecision | None:
-    """E5-3: una corrección reingresa al pipeline (re-dedup + re-clasifica).
+    """E5-3 (+ §5): una corrección reingresa al pipeline (re-dedup + re-clasifica).
 
-    Excluye el propio registro del pool (para no auto-matchearse) y reescribe la
-    fila con la decisión fresca. Devuelve la decisión, o None si no existe.
+    Permite corregir también note_type y deck (no solo front/back/tags). Excluye
+    el propio registro del pool para no auto-matchearse y reescribe la fila con
+    la decisión fresca. Devuelve la decisión, o None si no existe.
     """
     row = registry.get_by_id(record_id)
     if row is None:
         return None
 
+    existing_deck = row["target_deck"] if "target_deck" in row.keys() else None
     card = CandidateCard(
         front=front,
         back=back,
         source=row["source"],
         suggested_tags=tags or [],
-        note_type=row["note_type"] or "Basic",
+        note_type=note_type or row["note_type"] or "Basic",
         profile=row["profile_name"] if "profile_name" in row.keys() else None,
-        deck=row["target_deck"] if "target_deck" in row.keys() else None,
+        deck=deck or existing_deck,
         material_origen=row["material_origen"] if "material_origen" in row.keys() else None,
     )
     # Excluir el registro en corrección del pool para que no se auto-detecte dup.

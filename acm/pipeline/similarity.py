@@ -693,6 +693,11 @@ _COSINE_CALIBRATION: tuple[tuple[float, float], ...] = (
     (1.00, 1.00),
 )
 _EMBEDDING_REASON_FLOOR = 0.45  # coseno crudo desde el que se reporta embedding_match
+# Coseno crudo desde el cual se confía en el embedding SIN corroboración léxica
+# (cuasi-identidad). Debajo de esto, el embedding solo y sin scope/léxico que lo
+# apoye se considera "mismo tema, no mismo hecho" y NO refuerza el score — evita
+# los falsos positivos cross-vendor/cross-lingüe (ver reporte 2026-06-16 §3).
+_EMBEDDING_ONLY_STRONG_RAW = 0.96
 
 
 def _interpolate(table: tuple[tuple[float, float], ...], x: float, *, invert: bool) -> float:
@@ -789,11 +794,29 @@ def compare_records(
             + 0.10 * back_token_jaccard
         )
 
-    # --- Combinar señales (E0-2 + E1-6) ---
-    # El coseno se CALIBRA a la escala léxica antes de combinar (E1-6), y los
-    # embeddings SUMAN recall (paráfrasis sin solape léxico) pero NUNCA arrastran
-    # una señal léxica fuerte por debajo de sí misma (E0-2: max(), no reemplazo).
-    calibrated_embedding = calibrate_cosine(embedding_cosine) if has_embeddings else 0.0
+    # --- Combinar señales (E0-2 + E1-6 + precisión de dedup) ---
+    # El coseno se CALIBRA a la escala léxica (E1-6) y se combina con max() para
+    # no pisar la léxica fuerte (E0-2). PERO el embedding solo REFUERZA el score
+    # cuando hay corroboración (señal exacta o solape léxico) o cuasi-identidad
+    # (coseno crudo ≥ umbral), y NUNCA entre vendors distintos. Sin esto, las
+    # definiciones de servicios cloud de distinto vendor/idioma (coseno ~0.55-0.63
+    # = "mismo tema") se marcaban como duplicados (reporte 2026-06-16 §3).
+    vendor_left = left.scope.get("vendor")
+    vendor_right = right.scope.get("vendor")
+    cross_vendor = bool(vendor_left and vendor_right and vendor_left != vendor_right)
+    lexically_corroborated = (
+        is_exact_fingerprint
+        or is_exact_front
+        or is_semantic_match
+        or front_token_jaccard >= 0.50
+        or trigram_jaccard >= 0.40
+    )
+    embedding_trusted = (
+        has_embeddings
+        and not cross_vendor
+        and (lexically_corroborated or embedding_cosine >= _EMBEDDING_ONLY_STRONG_RAW)
+    )
+    calibrated_embedding = calibrate_cosine(embedding_cosine) if embedding_trusted else 0.0
     score = max(lexical_score, calibrated_embedding)
 
     # --- Reportar todas las señales que apliquen ---
@@ -803,8 +826,10 @@ def compare_records(
         reason_codes.append("exact_front")
     if is_semantic_match:
         reason_codes.append("semantic_key_match")
-    if has_embeddings and embedding_cosine >= _EMBEDDING_REASON_FLOOR:
+    if embedding_trusted and embedding_cosine >= _EMBEDDING_REASON_FLOOR:
         reason_codes.append("embedding_match")
+    elif has_embeddings and cross_vendor and embedding_cosine >= _EMBEDDING_REASON_FLOOR:
+        reason_codes.append("embedding_cross_vendor_ignored")
     if front_token_jaccard >= 0.50:
         reason_codes.append("token_overlap")
     if trigram_jaccard >= 0.40:

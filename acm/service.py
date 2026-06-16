@@ -8,6 +8,7 @@ las dos superficies (y las copias ya divergían).
 
 from __future__ import annotations
 
+import difflib
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,7 +29,31 @@ __all__ = [
     "resolve_deck_for_row",
     "backup_registry",
     "undo_batch",
+    "resolve_model_name",
 ]
+
+
+def resolve_model_name(
+    note_type: str | None, settings: Settings, available_models: list[str]
+) -> tuple[str | None, str | None]:
+    """Resuelve el modelo Anki real para un `note_type` (E0-3 / reporte §4).
+
+    Orden: (1) ya existe → tal cual; (2) alias configurado; (3) el placeholder
+    genérico "Basic" cae al default_model si existe; (4) sin resolución →
+    (None, error con sugerencia por cercanía). Devuelve (modelo, error).
+    """
+    models = available_models or []
+    candidate = note_type or settings.anki.default_model
+    if candidate in models:
+        return candidate, None
+    alias = settings.anki.model_aliases.get(candidate)
+    if alias and alias in models:
+        return alias, None
+    if candidate == "Basic" and settings.anki.default_model in models:
+        return settings.anki.default_model, None
+    suggestion = difflib.get_close_matches(candidate, models, n=1)
+    hint = f" ¿Quisiste '{suggestion[0]}'?" if suggestion else ""
+    return None, f"el modelo '{candidate}' no existe en Anki.{hint}"
 
 
 def backup_registry(settings: Settings) -> Path:
@@ -53,15 +78,17 @@ def try_anki_client(settings: Settings) -> AnkiConnectClient | None:
     return None
 
 
-def find_record_by_id_or_prefix(registry: Registry, record_id: str, candidates):
-    """Encuentra un registro por id completo o por prefijo único en `candidates`.
+def find_record_by_id_or_prefix(registry: Registry, record_id: str):
+    """Encuentra un registro por id completo o por prefijo, en TODOS los estados.
 
-    Devuelve (row, None) si hay match único, o (None, error_dict) si no/ambiguo.
+    Antes el prefijo solo miraba la cola activa (en-revision), así que rechazar
+    una ya-aprobada por prefijo fallaba (§6). Devuelve (row, None) si hay match
+    único, o (None, error_dict) si no existe / es ambiguo.
     """
     row = registry.get_by_id(record_id)
     if row:
         return row, None
-    matches = [r for r in candidates if r["id"].startswith(record_id)]
+    matches = registry.find_by_id_prefix(record_id)
     if len(matches) == 1:
         return matches[0], None
     if len(matches) > 1:
@@ -75,9 +102,7 @@ def resolve_record(registry: Registry, record_id: str, action: str) -> dict:
     if normalized not in {"approve", "reject"}:
         return {"error": "action debe ser 'approve' o 'reject'"}
 
-    row, error = find_record_by_id_or_prefix(
-        registry, record_id, registry.list_pending_review()
-    )
+    row, error = find_record_by_id_or_prefix(registry, record_id)
     if error:
         return error
 
@@ -137,32 +162,53 @@ def sync_pending(
             result["exported_count"] = exported
         return result
 
-    # E9-1: dry-run — previsualizar el plan sin insertar nada.
-    if dry_run:
-        plan = [
-            {"id": row["id"][:8], "deck": resolve_deck_for_row(row, settings, client),
-             "front": row["front_original"][:80]}
-            for row in pending
-        ]
+    # Preflight (reporte §4): resolver modelo+deck de CADA card antes de subir
+    # nada. Si algún modelo no existe en Anki, abortar sin subidas parciales.
+    available_models = client.get_model_names()
+    plan: list[tuple] = []  # (row, deck, model)
+    unresolved: list[dict] = []
+    for row in pending:
+        deck = resolve_deck_for_row(row, settings, client)
+        model, model_error = resolve_model_name(row["note_type"], settings, available_models)
+        if model_error:
+            unresolved.append({"id": row["id"][:8], "note_type": row["note_type"], "error": model_error})
+        plan.append((row, deck, model))
+
+    if unresolved:
         if owns_client:
             client.close()
-        return {"dry_run": True, "would_sync": plan, "count": len(plan), "anki_available": True}
+        return {
+            "error": "Modelos no encontrados en Anki — no se subió nada (preflight). "
+                     "Corregí el note_type o agregá un alias en anki.model_aliases.",
+            "problems": unresolved, "anki_available": True, "queued": len(pending),
+        }
+
+    # E9-1: dry-run — previsualizar el plan (modelo+deck ya resueltos) sin insertar.
+    if dry_run:
+        if owns_client:
+            client.close()
+        return {
+            "dry_run": True, "anki_available": True, "count": len(plan),
+            "would_sync": [
+                {"id": row["id"][:8], "deck": deck, "model": model,
+                 "front": row["front_original"][:80]}
+                for row, deck, model in plan
+            ],
+        }
 
     # E9-3: backup del registro antes de la operación masiva.
     backup_path = backup_registry(settings) if backup else None
-    # E9-2: lote deshacible.
-    batch_id = datetime.now(timezone.utc).isoformat()
+    batch_id = datetime.now(timezone.utc).isoformat()  # E9-2: lote deshacible
 
     fm = settings.anki.field_mapping
     synced: list[dict] = []
     errors: list[dict] = []
-    for row in pending:
+    for row, deck, model in plan:
         try:
             tags = row["tags_resolved"].split() if row["tags_resolved"] else []
-            deck = resolve_deck_for_row(row, settings, client)
             note_id = client.add_note(
                 deck=deck,
-                model=row["note_type"] or settings.anki.default_model,
+                model=model,
                 fields={fm.front: row["front_original"], fm.back: row["back_original"]},
                 tags=tags,
             )
