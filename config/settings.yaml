@@ -1,0 +1,83 @@
+anki:
+  connect_url: "http://localhost:8765"
+  default_deck: "Cloud Certs"
+  default_model: "Básico"
+  field_mapping:
+    front: "Anverso"
+    back: "Reverso"
+
+acm:
+  # Rutas relativas se resuelven bajo ACM_HOME (env var; default ~/.acm),
+  # NO contra el cwd — así dos invocaciones desde directorios distintos
+  # comparten el mismo registro. Dejá db_path vacío para usar el default.
+  db_path: "registry.db"
+  # taxonomy_path vacío → usa la taxonomía empaquetada en config/taxonomy.yaml.
+  taxonomy_path: ""
+  auto_insert: false
+  # Umbrales de coseno (motor kNN). Ver SPIKE_EMBEDDINGS.md para calibración.
+  cluster_threshold: 0.90
+  similar_lookup_threshold: 0.75
+  audit_include_subdecks: true
+  # Embeddings (Ollama). El spike E1-0 (SPIKE_EMBEDDINGS.md) eligió este modelo:
+  # qwen3-embedding:0.6b separa paráfrasis ES/EN (gap 0.35) y es liviano/rápido
+  # (1024 dim, ~29 ms/texto). nomic-embed-text no separa cross-lingual (gap ~0);
+  # qwen3-embedding:8b es marginalmente mejor pero 4x más lento. Cambiar el
+  # modelo invalida el embedding_cache. Si cambiás, recalibrá COSINE_CALIBRATION.
+  ollama_url: "http://localhost:11434"
+  ollama_model: "qwen3-embedding:0.6b"
+  use_embeddings: true
+  # E2-4: fallback de clasificación con LLM local (escalón previo a Claude).
+  # Off por defecto. qwen2.5:0.5b-instruct es liviano pero impreciso (validación);
+  # para producción configurá un modelo más capaz (p.ej. qwen2.5:7b-instruct).
+  use_llm_fallback: false
+  ollama_chat_model: "qwen2.5:0.5b-instruct"
+
+profiles:
+  # E2-1: las reglas específicas de materia viven ACÁ (data-driven), no en el
+  # código. Este perfil "default" es un pack de dominio para certs de nube; para
+  # otra materia, editá/duplicá este bloque (o dejalo vacío y dependé de la
+  # propagación por kNN + LLM local). El código no tiene keywords de dominio.
+  default:
+    keyword_rules:
+      vendor:
+        azure: ["azure", "microsoft azure", "az-", "az900", "az104", "az305",
+                "azure ad", "entra id", "entra", "arm template", "bicep",
+                "azure devops", "azure functions", "azure blob"]
+        aws: ["aws", "amazon web services", "ec2", "s3 bucket", "lambda",
+              "iam role", "cloudformation", "saa-c03", "route 53", "vpc",
+              "dynamo", "rds aurora"]
+        gcp: ["gcp", "google cloud", "bigquery", "gke", "cloud run", "pub/sub",
+              "cloud spanner", "firebase"]
+    topic_keywords:
+      identity: ["iam", "identity", "entra", "entra id", "azure ad",
+                 "active directory", "sso", "federation", "authentication",
+                 "authorization", "role", "policy"]
+      networking: ["vpc", "subnet", "route 53", "cloudfront", "alb", "nlb",
+                   "elb", "security group", "nat gateway", "internet gateway",
+                   "dns", "load balancer"]
+      storage: ["s3", "ebs", "efs", "glacier", "snowball", "storage", "bucket",
+                "object storage", "file storage", "block storage"]
+      compute: ["ec2", "lambda", "ecs", "eks", "fargate", "container",
+                "instance", "virtual machine", "vm", "autoscaling"]
+      security: ["kms", "waf", "shield", "guardduty", "inspector", "security",
+                 "encryption", "key management"]
+      monitoring: ["cloudwatch", "monitoring", "monitor", "logs", "metrics",
+                   "alarm", "trace", "x ray"]
+      governance: ["organizations", "control tower", "governance", "policy",
+                   "compliance", "budget", "cost explorer", "landing zone"]
+      databases: ["rds", "aurora", "dynamodb", "redshift", "database",
+                  "relational database", "nosql"]
+      iac: ["terraform", "hcl", "state", "provider", "module", "workspace",
+            "plan", "apply"]
+      secrets: ["vault", "token", "lease", "secret", "secrets engine", "kv",
+                "transit"]
+    deck_tag_rules:
+      "Cloud Certs::AWS::AWS Cloud Practitioner":
+        vendor: "aws"
+        cert: "clf-c02"
+      "Cloud Certs::HashiCorp::Vault Associate":
+        vendor: "hashicorp"
+        cert: "vault-associate"
+      "Cloud Certs::HashiCorp::Terraform Associate":
+        vendor: "hashicorp"
+        cert: "terraform-associate"

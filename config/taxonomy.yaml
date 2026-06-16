@@ -1,0 +1,31 @@
+vendor:
+- azure
+- aws
+- gcp
+- general
+- hashicorp
+cert:
+- az900
+- az104
+- az305
+- saa-c03
+- clf-c02
+- vault-associate
+- terraform-associate
+topic:
+- identity
+- networking
+- storage
+- compute
+- security
+- monitoring
+- governance
+- databases
+- iac
+- secrets
+type:
+- definition
+- comparison
+- command
+- scenario
+- acronym

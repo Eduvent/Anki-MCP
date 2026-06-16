@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.cache/
+
+# ACM local data (registry, vectors, queue, backups) — never version user data
+.acm/
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Docs de planificación/desarrollo (proyecto individual — el README es la
+# fuente. Se conservan localmente pero no se versionan).
+BACKLOG.md
+REQUISITOS_SISTEMA.md
+REVISION_ARQUITECTURA.md
