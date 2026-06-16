@@ -7,6 +7,10 @@ import unicodedata
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _MULTI_SPACE_RE = re.compile(r"\s+")
+# H1: contenido entre paréntesis/corchetes (aposiciones, alias) — se quita ANTES
+# de extraer la clave semántica para que "Azure AD (Entra ID)" y "Azure AD"
+# compartan clave. El embedding sigue viendo el texto completo.
+_BRACKET_RE = re.compile(r"\([^)]*\)|\[[^\]]*\]")
 _NON_WORD_RE = re.compile(r"[^\w\s]")
 _LEADING_ARTICLE_RE = re.compile(r"^(?:a|an|the|un|una|unos|unas|el|la|los|las)\s+")
 _TRAILING_MEAN_RE = re.compile(r"\s+mean$")
@@ -87,7 +91,8 @@ def _canonicalize_subject(text: str) -> str:
 
 def detect_intent_and_semantic_key(text: str) -> tuple[str, str | None]:
     """Detecta la intención principal del front y genera una clave canónica si aplica."""
-    normalized = normalize_semantic_text(text)
+    # H1: quitar aposiciones/alias entre paréntesis antes de derivar la clave.
+    normalized = normalize_semantic_text(_BRACKET_RE.sub(" ", text))
     if not normalized:
         return "unknown", None
 

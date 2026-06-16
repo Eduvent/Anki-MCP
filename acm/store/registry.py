@@ -96,6 +96,10 @@ STATUS_IN_REVIEW = "en-revision"
 STATUS_APPROVED = "aprobada"
 STATUS_UPLOADED = "subida"
 STATUS_DISCARDED = "descartada"
+STATUS_DELETED_IN_ANKI = "borrada-en-anki"  # H3: la nota se borró a mano en Anki
+
+# Estados "removidos": no cuentan como duplicado vivo para la dedup (H3/H4).
+REMOVED_STATUSES = (STATUS_DISCARDED, STATUS_DELETED_IN_ANKI)
 
 
 def derive_status(action: str, anki_note_id: int | None, has_unresolved: bool) -> str:
@@ -314,6 +318,39 @@ class Registry:
                 "SELECT * FROM processed_cards ORDER BY created_at ASC"
             ).fetchall()
         return rows
+
+    def list_active_cards(self) -> list[sqlite3.Row]:
+        """Cards 'vivas' para la dedup: excluye descartada y borrada-en-anki (H3/H4)."""
+        placeholders = ",".join("?" for _ in REMOVED_STATUSES)
+        with self._conn() as conn:
+            return conn.execute(
+                f"SELECT * FROM processed_cards WHERE status NOT IN ({placeholders}) "
+                "ORDER BY created_at ASC",
+                REMOVED_STATUSES,
+            ).fetchall()
+
+    def list_uploaded_note_ids(self) -> list[tuple[str, int]]:
+        """(record_id, anki_note_id) de las cards en estado 'subida' (para reconciliar)."""
+        with self._conn() as conn:
+            return [
+                (row["id"], row["anki_note_id"])
+                for row in conn.execute(
+                    "SELECT id, anki_note_id FROM processed_cards "
+                    "WHERE status = ? AND anki_note_id IS NOT NULL",
+                    (STATUS_UPLOADED,),
+                ).fetchall()
+            ]
+
+    def mark_deleted_in_anki(self, record_ids: list[str]) -> int:
+        """H3: marca registros como 'borrada-en-anki' (su nota ya no existe)."""
+        if not record_ids:
+            return 0
+        with self._conn() as conn:
+            conn.executemany(
+                "UPDATE processed_cards SET status = ? WHERE id = ?",
+                [(STATUS_DELETED_IN_ANKI, rid) for rid in record_ids],
+            )
+        return len(record_ids)
 
     def list_pending_sync(self) -> list[sqlite3.Row]:
         """Tarjetas aprobadas listas para subir (status aprobada, sin anki_note_id).

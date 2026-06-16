@@ -669,6 +669,19 @@ def enrich_records_with_embeddings(
     return enriched
 
 
+def _content_only(tokens: Iterable[str]) -> tuple[str, ...]:
+    """H2: tokens de CONTENIDO (sin stopwords/boilerplate ni mono-carácter).
+
+    El overlap léxico debe medirse sobre la entidad ("azure ad", "cloud shell"),
+    no sobre el molde de la pregunta ("¿qué es ___?"), que infla falsos positivos.
+    """
+    return tuple(
+        token
+        for token in tokens
+        if len(token) > 1 and token not in _STOPWORDS and token not in _BOILERPLATE_TOKENS
+    )
+
+
 def _jaccard(left: Iterable[str], right: Iterable[str]) -> float:
     left_set = set(left)
     right_set = set(right)
@@ -759,8 +772,11 @@ def compare_records(
         and left.features.semantic_key == right.features.semantic_key
     )
 
-    # --- Métricas léxicas ---
-    front_token_jaccard = _jaccard(left.features.content_tokens, right.features.content_tokens)
+    # --- Métricas léxicas (H2: overlap sobre tokens de contenido, no plantilla) ---
+    front_token_jaccard = _jaccard(
+        _content_only(left.features.content_tokens),
+        _content_only(right.features.content_tokens),
+    )
     trigram_jaccard = _jaccard(left.features.char_trigrams, right.features.char_trigrams)
     back_token_jaccard = _jaccard(left.features.back_tokens, right.features.back_tokens)
 
@@ -804,12 +820,13 @@ def compare_records(
     vendor_left = left.scope.get("vendor")
     vendor_right = right.scope.get("vendor")
     cross_vendor = bool(vendor_left and vendor_right and vendor_left != vendor_right)
+    # H2: el trigram NO corrobora al embedding (se infla con la plantilla de la
+    # pregunta); solo cuenta el solape de tokens de CONTENIDO o una señal exacta.
     lexically_corroborated = (
         is_exact_fingerprint
         or is_exact_front
         or is_semantic_match
         or front_token_jaccard >= 0.50
-        or trigram_jaccard >= 0.40
     )
     embedding_trusted = (
         has_embeddings

@@ -30,7 +30,48 @@ __all__ = [
     "backup_registry",
     "undo_batch",
     "resolve_model_name",
+    "reconcile_anki",
 ]
+
+
+def reconcile_anki(
+    registry: Registry,
+    settings: Settings,
+    *,
+    anki_client: AnkiConnectClient | None = None,
+) -> dict:
+    """H3: marca 'borrada-en-anki' los registros 'subida' cuya nota ya no existe.
+
+    Corrige el drift registro↔Anki (notas borradas a mano): así la dedup deja de
+    apuntar a huérfanos y el usuario puede re-agregar lo que borró a propósito.
+    """
+    uploaded = registry.list_uploaded_note_ids()
+    if not uploaded:
+        return {"checked": 0, "deleted_in_anki": 0, "anki_available": True}
+
+    owns_client = anki_client is None
+    client = anki_client or try_anki_client(settings)
+    if client is None:
+        return {"error": "Anki no disponible.", "anki_available": False}
+
+    note_ids = [note_id for _, note_id in uploaded]
+    existing: set[int] = set()
+    for start in range(0, len(note_ids), 500):
+        chunk = note_ids[start : start + 500]
+        query = "nid:" + ",".join(str(n) for n in chunk)
+        try:
+            existing.update(client.find_notes(query))
+        except AnkiConnectError as e:
+            if owns_client:
+                client.close()
+            return {"error": f"AnkiConnect: {e}", "anki_available": True}
+
+    if owns_client and client is not None:
+        client.close()
+
+    orphans = [record_id for record_id, note_id in uploaded if note_id not in existing]
+    marked = registry.mark_deleted_in_anki(orphans)
+    return {"checked": len(uploaded), "deleted_in_anki": marked, "anki_available": True}
 
 
 def resolve_model_name(

@@ -50,7 +50,8 @@ def refresh_deck_index(
 
 
 def _registry_pool(registry: Registry) -> list[DuplicateRecord]:
-    return [build_record_from_registry_row(row) for row in registry.list_processed_cards()]
+    # H3/H4: excluye descartada y borrada-en-anki del pool de dedup.
+    return [build_record_from_registry_row(row) for row in registry.list_active_cards()]
 
 
 def _indexed_pool(

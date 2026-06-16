@@ -73,3 +73,11 @@ def test_acronym_cross_lingual_shares_key():
 def test_plain_que_significa_stays_definition():
     # sin "siglas" → definición, no acrónimo
     assert build_semantic_key("¿Qué significa un CDN?") == "definition::cdn"
+
+
+def test_semantic_key_strips_parenthetical_alias():
+    # H1: el alias entre paréntesis no debe cambiar la clave
+    assert build_semantic_key("¿Qué es Azure AD (Microsoft Entra ID)?") == "definition::azure ad"
+    assert build_semantic_key("¿Qué es Azure AD (Microsoft Entra ID)?") == build_semantic_key(
+        "What is Azure AD?"
+    )

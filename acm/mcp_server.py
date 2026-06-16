@@ -41,6 +41,7 @@ from acm.pipeline.similarity import (
 )
 from acm.service import (
     backup_registry as _backup_registry,
+    reconcile_anki as _reconcile_anki,
     resolve_model_name as _resolve_model_name,
     resolve_record as _service_resolve,
     scope_from_row as _scope_from_row,
@@ -48,7 +49,7 @@ from acm.service import (
     try_anki_client as _try_anki_client,
     undo_batch as _service_undo,
 )
-from acm.store.registry import Registry
+from acm.store.registry import REMOVED_STATUSES, Registry
 
 mcp = FastMCP(
     "anki-card-manager",
@@ -244,7 +245,13 @@ def acm_ingest(cards_json: str, on_exact_match: str = "update", verbose: bool = 
         if existing is not None:
             if mode == "update":
                 registry.update_card_fields(existing["id"], d.card)
-                persisted.append((d, "updated", existing["id"]))
+                existing_status = existing["status"] if "status" in existing.keys() else None
+                if existing_status in REMOVED_STATUSES:
+                    # H3/H4: re-ingerir algo descartado o borrado-en-anki lo RESUCITA.
+                    registry.update_action(existing["id"], "insert")
+                    persisted.append((d, "resurrected", existing["id"]))
+                else:
+                    persisted.append((d, "updated", existing["id"]))
             else:  # skip
                 persisted.append((d, "skipped", existing["id"]))
         else:
@@ -570,9 +577,23 @@ def acm_audit(
         return acm_suggest_taxonomy(deck, profile=profile, include_subdecks=include_subdecks)
     if normalized == "maintenance":
         return acm_maintenance(deck, profile=profile, include_subdecks=include_subdecks)
+    if normalized == "reconcile":
+        return acm_reconcile(profile=profile)  # deck-agnóstico (toda la colección)
     return json.dumps({
-        "error": f"mode inválido: {mode}. Usa duplicates|recent|untagged|suggest_taxonomy|maintenance"
+        "error": f"mode inválido: {mode}. "
+                 "Usa duplicates|recent|untagged|suggest_taxonomy|maintenance|reconcile"
     })
+
+
+def acm_reconcile(profile: str | None = None) -> str:
+    """H3: reconcilia registro↔Anki — marca 'borrada-en-anki' las cards cuyo
+    note_id ya no existe en Anki (vía acm_audit mode=reconcile). Deck-agnóstico."""
+    registry, settings, _, _, _ = _setup(profile)
+    anki_client = _try_anki_client(settings)
+    result = _reconcile_anki(registry, settings, anki_client=anki_client)
+    if anki_client:
+        anki_client.close()
+    return json.dumps(result)
 
 
 def acm_maintenance(deck: str, profile: str | None = None, include_subdecks: bool = True) -> str:

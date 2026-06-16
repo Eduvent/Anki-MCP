@@ -351,6 +351,57 @@ def test_undo_ingest_batch_deletes_records(tmp_path, monkeypatch):
     assert reg.list_processed_cards() == []
 
 
+def test_reconcile_marks_orphans(tmp_path):
+    """H3: registros 'subida' cuya nota ya no existe en Anki → borrada-en-anki."""
+    import acm.service as service
+    reg = Registry(tmp_path / "t.db")
+    r1 = _insert(reg, _classified("Q1", "A1"), "insert")
+    r2 = _insert(reg, _classified("Q2", "A2"), "insert")
+    reg.mark_uploaded(r1, 111, "S1")
+    reg.mark_uploaded(r2, 222, "S1")
+
+    class _FakeAnkiPartial:
+        def find_notes(self, query):
+            return [111]  # 222 fue borrada en Anki
+
+        def close(self):
+            pass
+
+    res = service.reconcile_anki(reg, load_settings(), anki_client=_FakeAnkiPartial())
+    assert res["checked"] == 2 and res["deleted_in_anki"] == 1
+    assert reg.get_by_id(r2)["status"] == "borrada-en-anki"
+    assert reg.get_by_id(r1)["status"] == "subida"
+
+
+def test_reingest_resurrects_discarded(tmp_path, monkeypatch):
+    """H3/H4: re-ingerir algo descartado lo resucita (sin duplicar registro)."""
+    import acm.mcp_server as srv
+    settings = load_settings()
+    settings.acm.use_embeddings = False
+    name, profile, taxonomy = load_profile_taxonomy(settings)
+    reg = Registry(tmp_path / "t.db")
+    monkeypatch.setattr(srv, "_setup", lambda *a, **k: (reg, settings, name, profile, taxonomy))
+
+    class _NoAnki:
+        def __init__(self, *a, **k):
+            pass
+
+        def is_available(self):
+            return False
+
+    monkeypatch.setattr(srv, "AnkiConnectClient", _NoAnki)
+
+    cards = json.dumps([{"front": "What is Z?", "back": "W", "source": "claude"}])
+    srv.acm_ingest(cards)
+    rid = reg.list_processed_cards()[0]["id"]
+    reg.update_action(rid, "reject")  # descartada
+
+    res = json.loads(srv.acm_ingest(cards))  # re-ingesta
+    assert res["summary"].get("resurrected") == 1
+    assert reg.get_by_id(rid)["status"] == "aprobada"
+    assert len(reg.list_processed_cards()) == 1  # no se duplicó
+
+
 def test_metrics_auto_vs_escalated(tmp_path):
     reg = Registry(tmp_path / "t.db")
     _insert(reg, _classified("Q1", "A1"), "insert")  # aprobada

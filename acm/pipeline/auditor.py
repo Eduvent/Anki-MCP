@@ -26,9 +26,10 @@ from acm.store.registry import Registry, embedding_cache_io
 
 
 def _registry_records(registry: Registry) -> list[DuplicateRecord]:
+    # H3/H4: solo cards vivas; descartada y borrada-en-anki no son duplicados vivos.
     return [
         build_record_from_registry_row(row)
-        for row in registry.list_processed_cards()
+        for row in registry.list_active_cards()
     ]
 
 

@@ -53,6 +53,16 @@ def test_cross_vendor_high_cosine_still_not_a_match():
     assert edge is None
 
 
+def test_question_template_overlap_does_not_flag_duplicate():
+    """H2: compartir el molde '¿Qué es Azure ___?' no debe marcar duplicado."""
+    a = _rec("a", "¿Qué es Azure AD?", "El servicio de identidad de Azure", "azure",
+             source="input", cos=_unit(1.0))
+    b = _rec("b", "¿Qué es Azure Cloud Shell?", "Un shell en el navegador", "azure",
+             cos=_unit(0.58))
+    edge = compare_records(a, b, similar_threshold=0.75)
+    assert edge is None or edge.score < 0.90  # no escala a possible_duplicate
+
+
 def test_same_vendor_reformulation_still_matches():
     """Recall preservado: misma pregunta reformulada, mismo vendor → sí matchea."""
     q = _rec("q", "¿Dónde almacena archivos Azure Cloud Shell?", "En un Azure File Share", "azure",
@@ -106,3 +116,16 @@ def test_real_registry_duplicate_still_flagged(tmp_path):
     second = audit_batch([card], reg, _tax(), settings)[0]
     assert second.action == "possible_duplicate"
     assert any("exact_fingerprint" in m.get("reason_codes", []) for m in second.match_details)
+
+
+def test_discarded_record_excluded_from_dedup(tmp_path):
+    """H4: una card descartada no debe contar como duplicado vivo."""
+    settings = Settings()
+    settings.acm.use_embeddings = False
+    reg = Registry(tmp_path / "t.db")
+    card = CandidateCard(front="What is X?", back="Y", source="claude")
+    rid = reg.insert(audit_batch([card], reg, _tax(), settings)[0])
+    reg.update_action(rid, "reject")  # → descartada
+    # Re-auditar: no debe matchear el registro descartado.
+    again = audit_batch([card], reg, _tax(), settings)[0]
+    assert again.action == "insert"
