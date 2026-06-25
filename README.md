@@ -91,7 +91,7 @@ Agregá el servidor a tu configuración de Claude (Desktop/Code), por ejemplo:
 }
 ```
 
-Tools expuestas (13):
+Tools expuestas (19):
 
 | Tool | Qué hace |
 |---|---|
@@ -108,6 +108,12 @@ Tools expuestas (13):
 | `acm_auto_classify` | Clasificación determinista token-eficiente (sin LLM). |
 | `acm_taxonomy` | Consulta/edita la taxonomía: `action=show\|add`. |
 | `acm_stats` | Estadísticas + métricas de observabilidad + lotes deshacibles. |
+| `acm_decks` | Lista mazos de Anki con conteo de cards. |
+| `acm_review_stats` | Lee lapses, Again, tiempo medio, leeches y suspendidas desde el historial de repaso. |
+| `acm_retention` | Reporta retención aproximada por tag/dimensión. |
+| `acm_leech_clusters` | Agrupa leeches/cards lentas por similitud semántica reutilizando embeddings. |
+| `acm_repair` | Sugiere reparaciones no-destructivas para cards problemáticas. |
+| `acm_periodic_report` | Resumen on-demand semanal/mensual de estudio. |
 
 ### Como CLI
 

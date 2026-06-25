@@ -6,6 +6,10 @@ import unicodedata
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_BLOCK_RE = re.compile(
+    r"<(script|style)\b[^>]*>.*?</\1>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 _MULTI_SPACE_RE = re.compile(r"\s+")
 # H1: contenido entre paréntesis/corchetes (aposiciones, alias) — se quita ANTES
 # de extraer la clave semántica para que "Azure AD (Entra ID)" y "Azure AD"
@@ -45,7 +49,8 @@ def normalize_text(text: str) -> str:
     text = text.strip()
     # 2. Unicode NFKC (normaliza formas compuestas, full-width chars, etc.)
     text = unicodedata.normalize("NFKC", text)
-    # 3. Remover HTML tags
+    # 3. Remover bloques HTML que traen contenido no semántico (CSS/JS) y tags
+    text = _HTML_BLOCK_RE.sub(" ", text)
     text = _HTML_TAG_RE.sub(" ", text)
     # 4. Colapsar espacios múltiples (incluye \t, \n, etc.)
     text = _MULTI_SPACE_RE.sub(" ", text).strip()
@@ -61,8 +66,21 @@ def normalize_format(text: str) -> str:
     preserva mayúsculas y sentido: decodifica entidades HTML, quita tags, aplica
     NFKC y colapsa espacios. No-destructivo: se ofrece como sugerencia.
     """
-    text = html.unescape(text)
+    text = strip_html_for_display(text)
+    return text
+
+
+def strip_html_for_display(text: str) -> str:
+    """Limpia HTML/CSS/JS preservando mayúsculas para salidas token-eficientes.
+
+    AnkiConnect puede devolver el ``question`` renderizado con bloques
+    ``<style>…</style>`` antes del front real. Quitar solo tags deja el CSS como
+    texto, ensucia embeddings y explota la salida de MCP. Esta función remueve
+    bloques script/style completos, decodifica entidades y colapsa espacios.
+    """
+    text = html.unescape(text or "")
     text = unicodedata.normalize("NFKC", text)
+    text = _HTML_BLOCK_RE.sub(" ", text)
     text = _HTML_TAG_RE.sub(" ", text)
     text = _MULTI_SPACE_RE.sub(" ", text).strip()
     return text

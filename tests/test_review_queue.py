@@ -160,16 +160,23 @@ def test_correct_can_change_note_type(tmp_path, monkeypatch):
 
 
 class _FakeAnki:
-    def __init__(self, models=("Básico",)):
+    def __init__(self, models=("Básico",), model_fields=None):
         self.added = []
         self.deleted = []
         self._models = list(models)
+        self._model_fields = model_fields or {
+            "Básico": ["Anverso", "Reverso"],
+            "Cloze EduSksh": ["Text", "Back Extra"],
+        }
 
     def is_available(self):
         return True
 
     def get_model_names(self):
         return self._models
+
+    def get_model_field_names(self, model):
+        return self._model_fields[model]
 
     def resolve_deck(self, **kwargs):
         return "Cloud Certs"
@@ -194,6 +201,25 @@ def test_sync_resolves_basic_to_basico(tmp_path):
     res = service.sync_pending(reg, load_settings(), anki_client=fake, backup=False)
     assert res["synced_count"] == 1
     assert fake.added[0]["model"] == "Básico"
+    assert fake.added[0]["fields"] == {"Anverso": "Q", "Reverso": "A"}
+
+
+def test_sync_maps_cloze_to_real_model_fields(tmp_path):
+    """Cloze debe llenar Text (primer campo), no los campos del modelo Basic."""
+    import acm.service as service
+    reg = Registry(tmp_path / "t.db")
+    _insert(reg, _classified("{{c1::TCP}} is connection-oriented", "Layer 4",
+                             note_type="Cloze"), "insert")
+    fake = _FakeAnki(models=["Básico", "Cloze EduSksh"])
+
+    res = service.sync_pending(reg, load_settings(), anki_client=fake, backup=False)
+
+    assert res["synced_count"] == 1
+    assert fake.added[0]["model"] == "Cloze EduSksh"
+    assert fake.added[0]["fields"] == {
+        "Text": "{{c1::TCP}} is connection-oriented",
+        "Back Extra": "Layer 4",
+    }
 
 
 def test_sync_preflight_aborts_on_unknown_model(tmp_path):

@@ -17,7 +17,7 @@ from acm.pipeline.normalizer import (
 )
 
 
-Intent = Literal["definition", "comparison", "unknown"]
+Intent = Literal["definition", "comparison", "acronym", "command", "scenario", "unknown"]
 
 _STOPWORDS = {
     "a",

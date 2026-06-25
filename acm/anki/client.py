@@ -41,8 +41,24 @@ class AnkiConnectClient:
     def get_decks(self) -> list[str]:
         return self._request("deckNames")
 
+    def get_decks_with_ids(self) -> dict[str, int]:
+        return self._request("deckNamesAndIds")
+
+    def find_cards(self, query: str) -> list[int]:
+        return self._request("findCards", query=query)
+
+    def cards_info(self, card_ids: list[int]) -> list[dict]:
+        return self._request("cardsInfo", cards=card_ids)
+
+    def get_reviews_of_cards(self, card_ids: list[int]) -> dict:
+        return self._request("getReviewsOfCards", cards=card_ids)
+
     def get_model_names(self) -> list[str]:
         return self._request("modelNames")
+
+    def get_model_field_names(self, model: str) -> list[str]:
+        """Devuelve los campos reales y su orden para un modelo de Anki."""
+        return self._request("modelFieldNames", modelName=model)
 
     def find_notes(self, query: str) -> list[int]:
         return self._request("findNotes", query=query)
@@ -120,6 +136,13 @@ class AnkiConnectClient:
     def add_tags(self, note_ids: list[int], tags: str) -> None:
         """Agrega tags a notas existentes. tags es un string separado por espacios."""
         self._request("addTags", notes=note_ids, tags=tags)
+
+    def deck_card_count(self, deck: str, include_subdecks: bool = True) -> int:
+        decks = self.expand_decks(deck, include_subdecks=include_subdecks)
+        total = 0
+        for deck_name in decks:
+            total += len(self.find_cards(f'"deck:{deck_name}"'))
+        return total
 
     def remove_tags(self, note_ids: list[int], tags: str) -> None:
         """Remueve tags de notas existentes."""
