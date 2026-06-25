@@ -30,6 +30,12 @@ from acm.pipeline.duplicate_audit import (
 from acm.pipeline.embeddings import embeddings_available
 from acm.pipeline.normalizer import normalize_format, normalize_text
 from acm.pipeline.quality import quality_flags, suggest_cloze
+from acm.pipeline.review_stats import (
+    leech_clusters as build_leech_clusters,
+    repair_suggestions,
+    retention_by_tag,
+    review_stats as collect_review_stats,
+)
 from acm.pipeline.similarity import (
     DuplicateMatch,
     build_record_from_fields,
@@ -61,8 +67,9 @@ mcp = FastMCP(
         "mostrar al usuario una lista ya revisable; 2) acm_ingest para persistir; "
         "3) acm_resolve(id, approve|reject) sobre la cola (acm_review); 4) acm_sync "
         "para subir las aprobadas. acm_audit(deck, mode=duplicates|recent|untagged) "
-        "audita mazos existentes. acm_apply_tags, acm_taxonomy(action), acm_stats. "
-        "Economía de tokens: las tools resuelven local y solo devuelven el caso difícil."
+        "audita mazos existentes. acm_apply_tags, acm_taxonomy(action), acm_stats. Repaso real: "
+        "acm_decks, acm_review_stats, acm_retention, acm_leech_clusters, "
+        "acm_repair, acm_periodic_report. Economía de tokens: las tools resuelven local y solo devuelven el caso difícil."
     ),
 )
 
@@ -156,6 +163,17 @@ def _missing_categories(
             missing.append(category)
     return missing
 
+
+
+def _quality_flags_with_source(front: str, back: str, source: str | None) -> list[dict]:
+    flags = quality_flags(front, back)
+    if not (source or "").strip():
+        flags.append({
+            "code": "fuente_faltante",
+            "severity": "medium",
+            "hint": "Agregá Source/fuente (módulo, página o URL) para poder actualizar la card luego.",
+        })
+    return flags
 
 def _embeddings_used(settings) -> bool:
     """E0-3: ¿se usarán embeddings en esta corrida? Honesto sobre la degradación.
@@ -380,7 +398,7 @@ def acm_annotate(cards_json: str, verbose: bool = False) -> str:
             "tags_ambiguos": card.tags_unresolved,
             "scope": card.scope.summary(),
             "confianza": _classify_confidence(card, profile.required_categories),
-            "flags_calidad": quality_flags(card.front, card.back),
+            "flags_calidad": _quality_flags_with_source(card.front, card.back, card.material_origen or card.source),
             "sugerencia_cloze": suggest_cloze(card.front, card.back),  # E8-3
             "formato_sugerido": formato_sugerido or None,  # E8-4
             "note_type_warning": note_type_warning,  # §4: aviso temprano de modelo
@@ -790,6 +808,161 @@ def acm_find_similar_card(
         "embeddings_used": _embeddings_used(settings),
     })
 
+
+
+@mcp.tool()
+def acm_decks(include_subdecks: bool = False) -> str:
+    """Lista mazos de Anki con conteo de cards (06a). Determinista, sin LLM."""
+    settings = load_settings()
+    client = _try_anki_client(settings)
+    if client is None:
+        return json.dumps({"error": "Anki no disponible. Abre Anki con AnkiConnect.", "anki_available": False})
+    try:
+        decks = client.get_decks()
+        rows = [
+            {"deck": deck, "card_count": client.deck_card_count(deck, include_subdecks=include_subdecks)}
+            for deck in decks
+        ]
+    except AnkiConnectError as e:
+        client.close()
+        return json.dumps({"error": str(e), "anki_available": True})
+    client.close()
+    return json.dumps({"decks": rows, "count": len(rows), "anki_available": True, "embeddings_used": False})
+
+
+@mcp.tool()
+def acm_review_stats(
+    deck: str | None = None,
+    tag: str | None = None,
+    query: str | None = None,
+    min_lapses: int = 8,
+    limit: int = 50,
+) -> str:
+    """Lee desempeño real de repaso por card/nota desde Anki (01)."""
+    settings = load_settings()
+    client = _try_anki_client(settings)
+    if client is None:
+        return json.dumps({"error": "Anki no disponible. Abre Anki con AnkiConnect.", "anki_available": False})
+    try:
+        data = collect_review_stats(
+            client, deck=deck, tag=tag, query=query, min_lapses=min_lapses, limit=limit
+        )
+    except AnkiConnectError as e:
+        client.close()
+        return json.dumps({"error": str(e), "anki_available": True})
+    client.close()
+    data.pop("_raw_cards", None)
+    data["anki_available"] = True
+    data["embeddings_used"] = False
+    return json.dumps(data)
+
+
+@mcp.tool()
+def acm_retention(deck: str | None = None, tag: str | None = None, threshold: float = 0.80, limit: int = 20) -> str:
+    """Cruza stats de repaso con tags/facetas para detectar dónde falla más (02)."""
+    settings = load_settings()
+    client = _try_anki_client(settings)
+    if client is None:
+        return json.dumps({"error": "Anki no disponible. Abre Anki con AnkiConnect.", "anki_available": False})
+    try:
+        stats = collect_review_stats(client, deck=deck, tag=tag, limit=100000)
+        data = retention_by_tag(stats, threshold=threshold, limit=limit)
+    except AnkiConnectError as e:
+        client.close()
+        return json.dumps({"error": str(e), "anki_available": True})
+    client.close()
+    return json.dumps({**data, "anki_available": True, "embeddings_used": False})
+
+
+@mcp.tool()
+def acm_leech_clusters(
+    deck: str | None = None,
+    tag: str | None = None,
+    limit: int = 10,
+    max_members: int = 5,
+) -> str:
+    """Agrupa leeches/cards lentas por similitud semántica reutilizando embeddings (03)."""
+    registry, settings, profile_name, profile, taxonomy = _setup()
+    client = _try_anki_client(settings)
+    if client is None:
+        return json.dumps({"error": "Anki no disponible. Abre Anki con AnkiConnect.", "anki_available": False})
+    try:
+        stats = collect_review_stats(client, deck=deck, tag=tag, limit=100000)
+        data = build_leech_clusters(
+            stats=stats, registry=registry, settings=settings, taxonomy=taxonomy,
+            profile_name=profile_name, profile=profile, limit=limit,
+            max_members=max_members,
+        )
+    except AnkiConnectError as e:
+        client.close()
+        return json.dumps({"error": str(e), "anki_available": True})
+    client.close()
+    data["anki_available"] = True
+    return json.dumps(data)
+
+
+@mcp.tool()
+def acm_repair(deck: str | None = None, tag: str | None = None, limit: int = 10) -> str:
+    """Modo repair no-destructivo: propone causa/acción; no aplica cambios (04)."""
+    registry, settings, profile_name, profile, taxonomy = _setup()
+    client = _try_anki_client(settings)
+    if client is None:
+        return json.dumps({"error": "Anki no disponible. Abre Anki con AnkiConnect.", "anki_available": False})
+    try:
+        stats = collect_review_stats(client, deck=deck, tag=tag, limit=100000)
+        clusters = build_leech_clusters(
+            stats=stats, registry=registry, settings=settings, taxonomy=taxonomy,
+            profile_name=profile_name, profile=profile, limit=3, max_members=3,
+        )
+        data = repair_suggestions(stats, clusters, limit=limit)
+    except AnkiConnectError as e:
+        client.close()
+        return json.dumps({"error": str(e), "anki_available": True})
+    client.close()
+    return json.dumps({**data, "anki_available": True, "embeddings_used": clusters.get("embeddings_used", False)})
+
+
+@mcp.tool()
+def acm_periodic_report(deck: str | None = None, tag: str | None = None, threshold: float = 0.80) -> str:
+    """Reporte on-demand semanal/mensual: top Again, leeches, retención y lentas (05)."""
+    settings = load_settings()
+    client = _try_anki_client(settings)
+    if client is None:
+        return json.dumps({"error": "Anki no disponible. Abre Anki con AnkiConnect.", "anki_available": False})
+    try:
+        stats = collect_review_stats(client, deck=deck, tag=tag, limit=100000)
+        retention = retention_by_tag(stats, threshold=threshold, limit=10)
+    except AnkiConnectError as e:
+        client.close()
+        return json.dumps({"error": str(e), "anki_available": True})
+    client.close()
+    cards = stats.get("_raw_cards", [])
+    top_again = sorted(cards, key=lambda c: int(c.get("again_count") or 0), reverse=True)[:10]
+    slow = sorted(cards, key=lambda c: c.get("avg_review_time_ms") or 0, reverse=True)[:10]
+    all_leeches = [c for c in cards if c.get("leech")]
+    leeches = all_leeches[:10]
+    summary = dict(stats.get("summary", {}))
+    # Misma definición que acm_review_stats: tag leech OR lapses>=umbral.
+    # Recomputar desde _raw_cards evita divergencias si una salida compacta fue
+    # filtrada/truncada antes de componer el reporte.
+    summary["leeches"] = len(all_leeches)
+
+    def compact(card: dict) -> dict:
+        return {
+            k: v for k, v in card.items()
+            if k not in {"front_full", "back_full"}
+        }
+
+    return json.dumps({
+        "summary": summary,
+        "top_again": [compact(c) for c in top_again],
+        "leeches": [compact(c) for c in leeches],
+        "slow_cards": [compact(c) for c in slow],
+        "worst_retention": retention.get("groups", []),
+        "suggested_next_step": "Si hay leeches o baja retención, ejecuta acm_repair para preparar correcciones.",
+        "anki_available": True,
+        "embeddings_used": False,
+    })
 
 @mcp.tool()
 def acm_stats() -> str:

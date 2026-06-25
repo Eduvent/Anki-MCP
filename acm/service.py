@@ -30,6 +30,7 @@ __all__ = [
     "backup_registry",
     "undo_batch",
     "resolve_model_name",
+    "build_note_fields",
     "reconcile_anki",
 ]
 
@@ -95,6 +96,37 @@ def resolve_model_name(
     suggestion = difflib.get_close_matches(candidate, models, n=1)
     hint = f" ¿Quisiste '{suggestion[0]}'?" if suggestion else ""
     return None, f"el modelo '{candidate}' no existe en Anki.{hint}"
+
+
+def build_note_fields(
+    field_names: list[str],
+    front: str,
+    back: str,
+    *,
+    source: str | None = None,
+    material_origen: str | None = None,
+) -> dict[str, str]:
+    """Mapea el contenido a los campos reales del modelo, respetando su orden.
+
+    Anki exige que el primer campo no esté vacío. Consultar ``modelFieldNames``
+    evita asumir ``Front``/``Back``: Cloze usa normalmente ``Text`` y
+    ``Back Extra``, y los modelos localizados pueden usar otros nombres.
+    """
+    if not field_names:
+        raise ValueError("el modelo no tiene campos")
+    fields = {field_names[0]: front}
+    if len(field_names) > 1:
+        fields[field_names[1]] = back
+    # 06b: si el modelo tiene un campo Source/Fuente, mapearlo sin romper
+    # modelos Basic/Cloze que no lo tengan. `source` sigue siendo requerido y
+    # persistido aunque el note type no posea ese campo.
+    source_payload = material_origen or source
+    if source_payload:
+        normalized = {name.strip().lower(): name for name in field_names}
+        source_field = normalized.get("source") or normalized.get("fuente") or normalized.get("origen")
+        if source_field and source_field not in fields:
+            fields[source_field] = source_payload
+    return fields
 
 
 def backup_registry(settings: Settings) -> Path:
@@ -222,14 +254,25 @@ def sync_pending(
     # Preflight (reporte §4): resolver modelo+deck de CADA card antes de subir
     # nada. Si algún modelo no existe en Anki, abortar sin subidas parciales.
     available_models = client.get_model_names()
-    plan: list[tuple] = []  # (row, deck, model)
+    plan: list[tuple] = []  # (row, deck, model, field_names)
     unresolved: list[dict] = []
+    model_fields: dict[str, list[str]] = {}
     for row in pending:
         deck = resolve_deck_for_row(row, settings, client)
         model, model_error = resolve_model_name(row["note_type"], settings, available_models)
         if model_error:
             unresolved.append({"id": row["id"][:8], "note_type": row["note_type"], "error": model_error})
-        plan.append((row, deck, model))
+            plan.append((row, deck, model, []))
+            continue
+        if model not in model_fields:
+            model_fields[model] = client.get_model_field_names(model)
+        field_names = model_fields[model]
+        if not field_names:
+            unresolved.append({
+                "id": row["id"][:8], "note_type": row["note_type"],
+                "error": f"el modelo '{model}' no tiene campos",
+            })
+        plan.append((row, deck, model, field_names))
 
     if unresolved:
         if owns_client:
@@ -249,7 +292,7 @@ def sync_pending(
             "would_sync": [
                 {"id": row["id"][:8], "deck": deck, "model": model,
                  "front": row["front_original"][:80]}
-                for row, deck, model in plan
+                for row, deck, model, _field_names in plan
             ],
         }
 
@@ -257,16 +300,21 @@ def sync_pending(
     backup_path = backup_registry(settings) if backup else None
     batch_id = datetime.now(timezone.utc).isoformat()  # E9-2: lote deshacible
 
-    fm = settings.anki.field_mapping
     synced: list[dict] = []
     errors: list[dict] = []
-    for row, deck, model in plan:
+    for row, deck, model, field_names in plan:
         try:
             tags = row["tags_resolved"].split() if row["tags_resolved"] else []
             note_id = client.add_note(
                 deck=deck,
                 model=model,
-                fields={fm.front: row["front_original"], fm.back: row["back_original"]},
+                fields=build_note_fields(
+                    field_names,
+                    row["front_original"],
+                    row["back_original"],
+                    source=row["source"] if "source" in row.keys() else None,
+                    material_origen=row["material_origen"] if "material_origen" in row.keys() else None,
+                ),
                 tags=tags,
             )
             registry.mark_uploaded(row["id"], note_id, batch_id)
